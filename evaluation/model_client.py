@@ -1,7 +1,9 @@
 
 import os
 from openai import OpenAI
+from dotenv import load_dotenv
 
+load_dotenv()  # Load environment variables from .env
 
 class ModelClient:
     """Configurable client for hosted or OpenAI-compatible inference."""
@@ -9,16 +11,15 @@ class ModelClient:
     def __init__(self):
         self.base_url = os.getenv(
             "MODEL_BASE_URL",
-            "https://router.huggingface.co/v1",
+            "https://api.groq.com/openai/v1",
         )
 
         self.model = os.getenv(
             "MODEL_NAME",
-            "openai/gpt-oss-120b:groq",
+            "openai/gpt-oss-120b",
         )
 
-        api_key_env = os.getenv("MODEL_API_KEY_ENV", "HF_TOKEN")
-        api_key = os.getenv(api_key_env)
+        api_key = os.getenv("GROQ_API_KEY")
 
         if not api_key:
             raise ValueError(
