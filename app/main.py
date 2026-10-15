@@ -12,6 +12,7 @@ from evaluation.schemas import Assessment, Question, MarkingRubric, RubricCriter
 from evaluation.model_client import ModelClient
 from evaluation.evaluator import AnswerEvaluator
 from evaluation.flagging import collect_pre_evaluation_flags
+from evaluation.revaluation import parse_revaluation_csv, build_review_queue
 from evaluation.storage import (
     init_db,
     save_ai_evaluation,
@@ -19,6 +20,9 @@ from evaluation.storage import (
     list_evaluations,
     get_audit_history,
     get_evaluation,
+    save_revaluation_requests,
+    list_revaluation_requests,
+    update_revaluation_request,
 )
 
 st.set_page_config(page_title="Automated Answer Evaluator", page_icon="📝", layout="wide")
@@ -232,10 +236,10 @@ if st.button("Evaluate submitted answer script(s)", type="primary", use_containe
                     continue
                 answer = StudentAnswer(answer_id=f"{assessment_id}-{submission['roll_number']}-{question.question_id}", roll_number=submission["roll_number"], assessment_id=assessment_id, question_id=question.question_id, answer_text=answer_text, source_type="typed")
                 try:
-                    pre_flags = collect_pre_evaluation_flags(assessment, [answer])
+                    pre_flags = collect_pre_evaluation_flags(assessment , [answer])
                     with st.spinner(f"Evaluating student {student_index}/{len(submissions)} — {submission['roll_number']} — {question.question_id}..."):
                         result = evaluator.evaluate(assessment, question, answer)
-                    record_id = save_ai_evaluation(assessment=assessment, question=question, answer=answer, student_name=submission["student_name"], result=result)
+                    record_id = save_ai_evaluation(assessment=assessment, question=question, answer=answer, student_name=submission["student_name"], result=result, pre_flags=pre_flags)
                     saved_results.append({
                         "record_id": record_id,
                         "roll_number": submission["roll_number"],
@@ -249,7 +253,7 @@ if st.button("Evaluate submitted answer script(s)", type="primary", use_containe
                         ] + [
                             f"{flag.code.value}: {flag.reason}" for flag in result.flags
                         ],
-                        "status": "PENDING_REVIEW",
+                        "status": "AUTO_EVALUATED",
                     })
                 except Exception as exc:
                     errors.append({"roll_number": submission["roll_number"], "question_id": question.question_id, "error": str(exc)})
@@ -264,7 +268,7 @@ if st.button("Evaluate submitted answer script(s)", type="primary", use_containe
         st.session_state["last_batch_student_count"] = len(submissions)
         st.session_state["last_batch_answer_count"] = total_expected
         if saved_results:
-            st.success(f"Saved {len(saved_results)} evaluation record(s) for {len(submissions)} student submission(s). Teacher review is still required.")
+            st.success(f"Automatically evaluated and saved {len(saved_results)} answer(s) for {len(submissions)} student submission(s). No individual teacher approval is required. Review flagged answers or disputes when needed.")
         if errors:
             st.warning(f"{len(errors)} answer evaluation(s) failed. Successful records were retained; failed rows are listed below.")
     except ValueError as exc:
@@ -312,13 +316,13 @@ if st.session_state.get("last_batch_results") is not None:
 # 5. Persistent history --------------------------------------------------------
 st.divider()
 st.header("5. Persistent evaluation history")
-st.caption("One database record is stored per student-question pair. Original AI results are separate from teacher decisions.")
+st.caption("One database record is stored per student-question pair. AI marks are saved automatically; teacher decisions and revisions are separate and optional.")
 try:
     records = list_evaluations(limit=1000)
     if records:
         history_table = []
         for record in records:
-            history_table.append({"Record ID": record["id"], "Assessment": record["assessment_id"], "Student": record.get("student_name") or "—", "Roll number": record["roll_number"], "Question": record["question_id"], "AI marks": f"{record['ai_marks']:g} / {record['max_marks']:g}", "Teacher marks": f"{record['teacher_marks']:g} / {record['max_marks']:g}" if record["teacher_marks"] is not None else "Pending", "Status": record["review_status"], "Updated (UTC)": record["updated_at"]})
+            history_table.append({"Record ID": record["id"], "Assessment": record["assessment_id"], "Student": record.get("student_name") or "—", "Roll number": record["roll_number"], "Question": record["question_id"], "AI marks": f"{record['ai_marks']:g} / {record['max_marks']:g}", "Teacher marks": f"{record['teacher_marks']:g} / {record['max_marks']:g}" if record["teacher_marks"] is not None else "Not reviewed (AI marks apply)", "Status": record["review_status"], "Updated (UTC)": record["updated_at"]})
         st.dataframe(history_table, use_container_width=True, hide_index=True)
         record_options = [int(r["id"]) for r in records]
         selected_id = st.selectbox("Select a saved answer evaluation to review", options=record_options, format_func=lambda rid: next(f"#{r['id']} — {r['assessment_id']} / {r.get('student_name') or r['roll_number']} / {r['question_id']} ({r['review_status']})" for r in records if int(r["id"]) == int(rid)), key="review_record_selector")
@@ -387,15 +391,17 @@ try:
                 current_teacher_marks = selected.get("teacher_marks")
                 if current_teacher_marks is None:
                     current_teacher_marks = float(selected["ai_marks"])
-                st.write(f"**Current teacher marks:** {float(current_teacher_marks):g} / {float(selected['max_marks']):g}")
+                st.write(f"**Current effective marks:** {float(current_teacher_marks):g} / {float(selected['max_marks']):g}")
                 st.write(f"**Review status:** {selected['review_status']}")
+                if not selected.get("teacher_approved"):
+                    st.info("These marks are the saved AI evaluation. Teacher approval is optional; use this form only if you want to review or change the result.")
                 if selected.get("teacher_note"):
                     st.write(f"**Latest teacher note:** {selected['teacher_note']}")
                 with st.form(f"teacher_review_form_{selected_id}"):
                     teacher_name = st.text_input("Teacher name", value=approved_by.strip() or "Teacher", key=f"teacher_name_{selected_id}")
                     teacher_marks = st.number_input("Teacher marks", min_value=0.0, max_value=float(selected["max_marks"]), value=float(current_teacher_marks), step=0.5, key=f"teacher_marks_{selected_id}")
                     teacher_note = st.text_area("Review note (required when changing marks)", value=selected.get("teacher_note") or "", key=f"teacher_note_{selected_id}")
-                    save_decision = st.form_submit_button("Save teacher decision / revision")
+                    save_decision = st.form_submit_button("Save optional teacher review / revision")
                 if save_decision:
                     changed = abs(float(teacher_marks) - float(current_teacher_marks)) > 1e-6
                     if changed and not teacher_note.strip():
@@ -420,3 +426,407 @@ try:
 except Exception as exc:
     st.error("Could not load persistent evaluation history.")
     st.exception(exc)
+
+# 6. Flagged-answer teacher review queue ----------------------------------------
+st.divider()
+st.header("6. Teacher review queue — flagged answers")
+st.caption(
+    "Only answers with saved AI or pre-evaluation flags are listed here. "
+    "AI marks remain saved automatically; this queue is for optional teacher attention."
+)
+
+try:
+    queue_records = list_evaluations(limit=1000)
+    flagged_items = []
+    for item in queue_records:
+        full_record = get_evaluation(int(item["id"]))
+        if not full_record:
+            continue
+        try:
+            ai_payload = json.loads(full_record.get("ai_result_json") or "{}")
+        except (TypeError, ValueError):
+            ai_payload = {}
+        try:
+            pre_payload = json.loads(full_record.get("pre_flags_json") or "[]")
+        except (TypeError, ValueError):
+            pre_payload = []
+
+        combined_flags = []
+        for flag in pre_payload if isinstance(pre_payload, list) else []:
+            if isinstance(flag, dict):
+                combined_flags.append({
+                    "source": "Pre-evaluation",
+                    "code": flag.get("code", "PRE_EVALUATION_FLAG"),
+                    "reason": flag.get("reason", str(flag)),
+                    "severity": flag.get("severity", "WARNING"),
+                })
+            else:
+                combined_flags.append({
+                    "source": "Pre-evaluation",
+                    "code": getattr(getattr(flag, "code", None), "value", "PRE_EVALUATION_FLAG"),
+                    "reason": getattr(flag, "reason", str(flag)),
+                    "severity": getattr(getattr(flag, "severity", None), "value", "WARNING"),
+                })
+
+        ai_flags = ai_payload.get("flags") or []
+        if isinstance(ai_flags, list):
+            for flag in ai_flags:
+                if isinstance(flag, dict):
+                    combined_flags.append({
+                        "source": "AI evaluation",
+                        "code": flag.get("code", "AI_REVIEW_FLAG"),
+                        "reason": flag.get("reason", str(flag)),
+                        "severity": flag.get("severity", "WARNING"),
+                    })
+
+        if combined_flags:
+            flagged_items.append((full_record, ai_payload, combined_flags))
+
+    if not flagged_items:
+        st.success("No saved flagged answers found. Answers without flags do not require routine teacher review.")
+    else:
+        st.warning(f"{len(flagged_items)} answer(s) need attention. This is a review suggestion, not proof that the AI marks are incorrect.")
+        queue_table = []
+        for record, ai_payload, flags in flagged_items:
+            queue_table.append({
+                "Record ID": record["id"],
+                "Assessment": record["assessment_id"],
+                "Roll number": record["roll_number"],
+                "Student": record.get("student_name") or "—",
+                "Question": record["question_id"],
+                "AI marks": f"{float(record['ai_marks']):g} / {float(record['max_marks']):g}",
+                "Flag count": len(flags),
+                "Flag reasons": "; ".join(
+                    f"{f['code']}: {f['reason']}" for f in flags
+                ),
+                "Status": record["review_status"],
+            })
+        st.dataframe(queue_table, use_container_width=True, hide_index=True)
+
+        flagged_ids = [int(record["id"]) for record, _, _ in flagged_items]
+        selected_flagged_id = st.selectbox(
+            "Choose a flagged answer to inspect",
+            options=flagged_ids,
+            format_func=lambda rid: next(
+                f"#{record['id']} — {record['assessment_id']} / roll {record['roll_number']} / "
+                f"{record['question_id']} — {float(record['ai_marks']):g}/{float(record['max_marks']):g}"
+                for record, _, _ in flagged_items if int(record["id"]) == int(rid)
+            ),
+            key="flagged_answer_selector",
+        )
+        chosen = next(
+            (record, ai_payload, flags)
+            for record, ai_payload, flags in flagged_items
+            if int(record["id"]) == int(selected_flagged_id)
+        )
+        chosen_record, chosen_ai, chosen_flags = chosen
+        with st.expander("Flag details, answer and rubric", expanded=True):
+            st.write(f"**Student:** {chosen_record.get('student_name') or '—'} · **Roll number:** {chosen_record['roll_number']}")
+            st.write(f"**Question ID:** {chosen_record['question_id']}")
+            st.write(f"**Question:** {chosen_record['question_text']}")
+            st.write(f"**AI marks:** {float(chosen_record['ai_marks']):g} / {float(chosen_record['max_marks']):g}")
+            st.write("**Student answer:**")
+            st.text_area(
+                "Flagged student answer (read-only)",
+                value=chosen_record.get("answer_text") or "",
+                disabled=True,
+                key=f"flagged_answer_text_{selected_flagged_id}",
+                height=160,
+            )
+            st.write("**Why this answer was flagged:**")
+            for flag in chosen_flags:
+                st.warning(f"{flag['source']} · {flag['severity']} · {flag['code']}: {flag['reason']}")
+            st.write("**AI rationale:**", chosen_ai.get("rationale", "No rationale saved."))
+            st.write("**AI feedback:**", chosen_ai.get("student_feedback", "No feedback saved."))
+            try:
+                saved_assessment = json.loads(chosen_record.get("assessment_json") or "{}")
+                saved_questions = saved_assessment.get("questions") or []
+                saved_question = next(
+                    (q for q in saved_questions if str(q.get("question_id", "")).strip() == str(chosen_record["question_id"]).strip()),
+                    None,
+                )
+                if saved_question:
+                    st.write("**Saved rubric:**")
+                    st.json(saved_question.get("rubric") or {})
+            except (TypeError, ValueError):
+                st.info("Saved rubric details are unavailable.")
+
+            st.info("If you decide to change the marks, use the existing optional teacher review form in Persistent evaluation history. A reason is required when marks change.")
+
+except Exception as exc:
+    st.error("Could not build the flagged-answer review queue.")
+    st.exception(exc)
+
+# 7. Google Forms re-evaluation request import ---------------------------------
+
+st.divider()
+st.header("7. Re-evaluation review queue")
+st.caption(
+    "Import the CSV exported from Google Forms. Requests are matched to saved "
+    "evaluations, grouped by question/subpart, and flagged when more than the "
+    "configured percentage of evaluated students raise a concern."
+)
+
+all_history = list_evaluations(limit=1000)
+assessment_options = sorted({
+    str(row.get("assessment_id", "")).strip()
+    for row in all_history if str(row.get("assessment_id", "")).strip()
+})
+if not assessment_options:
+    st.info("Evaluate and save at least one assessment before importing re-evaluation requests.")
+else:
+    selected_assessment_for_requests = st.selectbox(
+        "Assessment for these requests",
+        options=assessment_options,
+        key="reval_assessment_select",
+    )
+    threshold = float(st.number_input(
+        "Majority concern flag threshold (%)",
+        min_value=0.0, max_value=100.0, value=50.0, step=5.0,
+        help="A question/subpart is flagged only when its unique-student concern rate is strictly greater than this threshold.",
+        key="reval_threshold",
+    ))
+    st.write(
+        "Expected Google Form fields: student roll number, college email, "
+        "question number, subpart (optional), and reason for re-evaluation. "
+        "Header labels can vary; common Google Forms headings are recognized."
+    )
+    request_csv = st.file_uploader(
+        "Upload Google Forms responses CSV",
+        type=["csv"],
+        key="revaluation_requests_csv",
+    )
+    if request_csv is not None:
+        parsed_requests, parse_issues = parse_revaluation_csv(
+            request_csv.getvalue(),
+            default_assessment_id=selected_assessment_for_requests,
+        )
+        for issue in parse_issues:
+            st.warning(issue)
+        if parsed_requests:
+            existing_evaluations = [
+                row for row in all_history
+                if str(row.get("assessment_id", "")).strip() == selected_assessment_for_requests
+            ]
+            queue_preview = build_review_queue(
+                parsed_requests,
+                existing_evaluations,
+                assessment_id=selected_assessment_for_requests,
+                threshold_percent=threshold,
+            )
+            st.write(
+                f"Parsed **{len(parsed_requests)}** request(s): "
+                f"**{len(queue_preview['matched_requests'])}** matched and "
+                f"**{len(queue_preview['unmatched_requests'])}** unmatched."
+            )
+            if queue_preview["queue"]:
+                st.subheader("Preview: grouped question/subpart queue")
+                st.dataframe(
+                    [{
+                        "Question / subpart": group["label"],
+                        "Unique requesting students": group["unique_student_count"],
+                        "Requests": group["request_count"],
+                        "Evaluated students": group["evaluated_student_count"],
+                        "Concern rate (%)": group["concern_rate_percent"],
+                        "Majority flag": "FLAGGED" if group["majority_flag"] else "Normal",
+                    } for group in queue_preview["queue"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                flagged_groups = [g for g in queue_preview["queue"] if g["majority_flag"]]
+                if flagged_groups:
+                    st.warning(
+                        "Majority concern flag(s): "
+                        + ", ".join(f"{g['label']} ({g['concern_rate_percent']}%)" for g in flagged_groups)
+                    )
+                else:
+                    st.success("No question/subpart exceeds the current majority concern threshold.")
+            if queue_preview["unmatched_requests"]:
+                with st.expander("Unmatched requests — require correction", expanded=True):
+                    st.dataframe(
+                        [{
+                            "CSV row": item.get("source_row"),
+                            "Roll number": item.get("roll_number"),
+                            "Question": item.get("question_id"),
+                            "Subpart": item.get("subpart"),
+                            "Issue": item.get("match_issue"),
+                        } for item in queue_preview["unmatched_requests"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            if st.button("Import matched requests and create review queue", type="primary", key="import_reval_requests"):
+                saved = save_revaluation_requests(
+                    assessment_id=selected_assessment_for_requests,
+                    requests=queue_preview["matched_requests"],
+                )
+                st.success(
+                    f"Imported {saved['inserted']} new request(s). "
+                    f"Skipped {saved['duplicates']} duplicate(s); "
+                    f"{saved['unmatched']} unmatched request(s) were not saved."
+                )
+                st.rerun()
+
+    st.subheader("Saved re-evaluation requests")
+    saved_requests = list_revaluation_requests(selected_assessment_for_requests)
+    if not saved_requests:
+        st.info("No re-evaluation requests have been imported for this assessment yet.")
+    else:
+        # Rebuild the grouped queue from persistent requests so it remains
+        # available after a rerun or a later visit to the app.
+        persisted_request_rows = [{
+            "assessment_id": r.get("assessment_id") or selected_assessment_for_requests,
+            "roll_number": str(r.get("roll_number") or ""),
+            "student_name": str(r.get("student_name") or ""),
+            "email": str(r.get("student_email") or ""),
+            "question_id": str(r.get("question_id") or ""),
+            "subpart": str(r.get("subpart") or ""),
+            "reason": str(r.get("reason") or ""),
+            "source_row": str(r.get("source_row") or "0"),
+        } for r in saved_requests]
+        persistent_queue = build_review_queue(
+            persisted_request_rows,
+            [row for row in all_history if str(row.get("assessment_id", "")).strip() == selected_assessment_for_requests],
+            assessment_id=selected_assessment_for_requests,
+            threshold_percent=threshold,
+        )
+        st.subheader("Grouped review queue")
+        st.dataframe([{
+            "Question / subpart": group["label"],
+            "Unique requesting students": group["unique_student_count"],
+            "Requests": group["request_count"],
+            "Evaluated students": group["evaluated_student_count"],
+            "Concern rate (%)": group["concern_rate_percent"],
+            "Majority flag": "FLAGGED" if group["majority_flag"] else "Normal",
+        } for group in persistent_queue["queue"]], use_container_width=True, hide_index=True)
+        persistent_flags = [group for group in persistent_queue["queue"] if group["majority_flag"]]
+        if persistent_flags:
+            st.warning("Majority concern flag(s): " + ", ".join(
+                f"{group['label']} ({group['concern_rate_percent']}%)" for group in persistent_flags
+            ))
+        else:
+            st.success("No saved question/subpart group exceeds the current majority concern threshold.")
+        def format_question_label(row):
+            question = str(row.get("question_id", ""))
+            subpart = str(row.get("subpart") or "").strip()
+            return f"{question}({subpart})" if subpart else question
+        st.dataframe(
+            [{
+                "Request ID": r["id"],
+                "Question / subpart": format_question_label(r),
+                "Roll number": r["roll_number"],
+                "Email": r.get("student_email") or "—",
+                "Status": r["status"],
+                "AI marks": f"{float(r['ai_marks']):g} / {float(r['max_marks']):g}" if r.get("ai_marks") is not None else "Unmatched",
+            } for r in saved_requests],
+            use_container_width=True,
+            hide_index=True,
+        )
+        request_ids = [int(r["id"]) for r in saved_requests]
+        selected_request_id = st.selectbox(
+            "Select a request to inspect",
+            options=request_ids,
+            format_func=lambda rid: next(
+                f"#{r['id']} — {format_question_label(r)} — {r['roll_number']} — {r['status']}"
+                for r in saved_requests if int(r["id"]) == int(rid)
+            ),
+            key="selected_revaluation_request",
+        )
+        selected_request = next(r for r in saved_requests if int(r["id"]) == int(selected_request_id))
+        with st.expander("Request details and original evaluation", expanded=True):
+            st.write(f"**Student:** {selected_request.get('student_name') or '—'} · **Roll number:** {selected_request['roll_number']}")
+            st.write(f"**Email:** {selected_request.get('student_email') or '—'}")
+            st.write(f"**Question / subpart:** {format_question_label(selected_request)}")
+            st.write("**Student's concern:**")
+            st.write(selected_request["reason"])
+            st.write("**Original question:**")
+            st.write(selected_request.get("question_text") or "Question text unavailable.")
+            st.write("**Original answer:**")
+            st.text_area(
+                "Saved student answer (read-only)",
+                value=selected_request.get("answer_text") or "",
+                disabled=True,
+                key=f"reval_answer_{selected_request_id}",
+                height=140,
+            )
+            if selected_request.get("evaluation_id"):
+                linked_eval = get_evaluation(int(selected_request["evaluation_id"]))
+                if linked_eval:
+                    try:
+                        ai_data = json.loads(linked_eval.get("ai_result_json") or "{}")
+                        st.metric("Original AI marks", f"{float(linked_eval['ai_marks']):g} / {float(linked_eval['max_marks']):g}")
+                        st.write("**AI rationale:**", ai_data.get("rationale", "No rationale saved."))
+                        st.write("**AI feedback:**", ai_data.get("student_feedback", "No feedback saved."))
+                        st.write("**Rubric / assessment context:**")
+                        assessment_data = json.loads(linked_eval.get("assessment_json") or "{}")
+                        questions = assessment_data.get("questions") or []
+                        matching_question = next(
+                            (q for q in questions if str(q.get("question_id", "")).strip() == str(linked_eval.get("question_id", "")).strip()),
+                            None,
+                        )
+                        if matching_question:
+                            st.json(matching_question.get("rubric") or {})
+                        else:
+                            st.info("Rubric details could not be located in the saved assessment JSON.")
+                    except (TypeError, ValueError):
+                        st.warning("Could not decode the saved evaluation/rubric details.")
+            st.divider()
+            current_status = selected_request["status"]
+            status_options = ["SUBMITTED", "UNDER_REVIEW", "RESOLVED_UPHELD", "RESOLVED_REVISED"]
+            status_index = status_options.index(current_status) if current_status in status_options else 0
+            with st.form(f"reval_decision_form_{selected_request_id}"):
+                request_status = st.selectbox("Request status", options=status_options, index=status_index)
+                teacher_decision = st.text_input(
+                    "Decision summary",
+                    value=selected_request.get("teacher_decision") or "",
+                    help="For example: Original marks upheld, or marks revised through the teacher review workflow.",
+                )
+                teacher_note = st.text_area(
+                    "Teacher note",
+                    value=selected_request.get("teacher_note") or "",
+                    help="Record the reasoning for the request decision.",
+                )
+                save_request_decision = st.form_submit_button("Save request status")
+            if save_request_decision:
+                try:
+                    update_revaluation_request(
+                        request_id=int(selected_request_id),
+                        status=request_status,
+                        teacher_decision=teacher_decision,
+                        teacher_note=teacher_note,
+                        actor=approved_by.strip() or "Teacher",
+                    )
+                    st.success("Request status saved.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+        # Downloadable request-level review sheet.
+        review_rows = []
+        for request in saved_requests:
+            review_rows.append({
+                "request_id": request["id"],
+                "assessment_id": request["assessment_id"],
+                "roll_number": request["roll_number"],
+                "student_name": request.get("student_name") or "",
+                "email": request.get("student_email") or "",
+                "question_id": request["question_id"],
+                "subpart": request.get("subpart") or "",
+                "reason": request["reason"],
+                "evaluation_id": request.get("evaluation_id") or "",
+                "ai_marks": request.get("ai_marks") if request.get("ai_marks") is not None else "",
+                "teacher_marks": request.get("teacher_marks") if request.get("teacher_marks") is not None else "",
+                "max_marks": request.get("max_marks") if request.get("max_marks") is not None else "",
+                "status": request["status"],
+                "teacher_decision": request.get("teacher_decision") or "",
+                "teacher_note": request.get("teacher_note") or "",
+            })
+        review_csv = io.StringIO(newline="")
+        review_writer = csv.DictWriter(review_csv, fieldnames=list(review_rows[0].keys()))
+        review_writer.writeheader()
+        review_writer.writerows(review_rows)
+        st.download_button(
+            "Download consolidated re-evaluation review sheet (CSV)",
+            data=review_csv.getvalue().encode("utf-8-sig"),
+            file_name=f"{selected_assessment_for_requests}_revaluation_review.csv",
+            mime="text/csv",
+        )

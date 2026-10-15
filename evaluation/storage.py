@@ -52,12 +52,13 @@ def init_db() -> None:
                 max_marks REAL NOT NULL,
                 ai_marks REAL NOT NULL,
                 ai_result_json TEXT NOT NULL,
+                pre_flags_json TEXT NOT NULL DEFAULT '[]',
                 assessment_json TEXT NOT NULL,
                 answer_json TEXT NOT NULL,
                 teacher_marks REAL,
                 teacher_note TEXT,
                 teacher_approved INTEGER NOT NULL DEFAULT 0,
-                review_status TEXT NOT NULL DEFAULT 'PENDING_REVIEW',
+                review_status TEXT NOT NULL DEFAULT 'AUTO_EVALUATED',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -80,13 +81,52 @@ def init_db() -> None:
                 ON evaluations(assessment_id, roll_number);
             CREATE INDEX IF NOT EXISTS idx_audit_evaluation_id
                 ON audit_log(evaluation_id, id);
+
+            CREATE TABLE IF NOT EXISTS revaluation_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assessment_id TEXT NOT NULL,
+                evaluation_id INTEGER,
+                roll_number TEXT NOT NULL,
+                student_email TEXT,
+                question_id TEXT NOT NULL,
+                subpart TEXT,
+                reason TEXT NOT NULL,
+                source_row TEXT,
+                status TEXT NOT NULL DEFAULT 'SUBMITTED',
+                teacher_decision TEXT,
+                teacher_note TEXT,
+                updated_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (evaluation_id) REFERENCES evaluations(id)
+                    ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_revaluation_assessment_question
+                ON revaluation_requests(assessment_id, question_id, subpart);
+            CREATE INDEX IF NOT EXISTS idx_revaluation_roll
+                ON revaluation_requests(assessment_id, roll_number);
             """
+        )
+        # Backward-compatible migration for databases created before pre_flags_json.
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(evaluations)").fetchall()
+        }
+        if "pre_flags_json" not in columns:
+            conn.execute(
+                "ALTER TABLE evaluations ADD COLUMN pre_flags_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        # AI-only records are complete evaluations, not pending teacher approvals.
+        conn.execute(
+            """UPDATE evaluations
+               SET review_status = 'AUTO_EVALUATED'
+               WHERE teacher_approved = 0 AND review_status = 'PENDING_REVIEW'"""
         )
 
 
 def save_ai_evaluation(
     *, assessment: Any, question: Any, answer: Any,
-    student_name: str | None, result: Any,
+    student_name: str | None, result: Any, pre_flags: list[Any] | None = None,
 ) -> int:
     """Insert a new AI evaluation and its first audit event; return row ID."""
     init_db()
@@ -96,9 +136,9 @@ def save_ai_evaluation(
             """INSERT INTO evaluations (
                 assessment_id, assessment_title, subject, roll_number,
                 student_name, question_id, question_text, answer_text,
-                max_marks, ai_marks, ai_result_json, assessment_json,
-                answer_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                max_marks, ai_marks, ai_result_json, pre_flags_json, assessment_json,
+                answer_json, review_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AUTO_EVALUATED', ?, ?)""",
             (
                 assessment.assessment_id,
                 assessment.title,
@@ -111,6 +151,7 @@ def save_ai_evaluation(
                 float(result.max_marks),
                 float(result.marks_awarded),
                 _json_dump(result),
+                _json_dump(pre_flags or []),
                 _json_dump(assessment),
                 _json_dump(answer),
                 timestamp,
@@ -238,3 +279,102 @@ def get_evaluation(evaluation_id: int) -> dict[str, Any] | None:
             "SELECT * FROM evaluations WHERE id = ?", (int(evaluation_id),)
         ).fetchone()
     return dict(row) if row else None
+
+
+def save_revaluation_requests(
+    *, assessment_id: str, requests: list[dict[str, Any]], actor: str = "Teacher"
+) -> dict[str, int]:
+    """Persist matched and unmatched re-evaluation requests without changing marks."""
+    init_db()
+    timestamp = _now()
+    inserted = 0
+    duplicates = 0
+    unmatched = 0
+    with _connect() as conn:
+        for request in requests:
+            evaluation_id = request.get("evaluation_id")
+            roll = str(request.get("roll_number", "")).strip()
+            question_id = str(request.get("question_id", "")).strip()
+            subpart = str(request.get("subpart", "")).strip()
+            reason = str(request.get("reason", "")).strip()
+            email = str(request.get("email", "")).strip().lower()
+            source_row = request.get("source_row")
+            if not evaluation_id:
+                unmatched += 1
+                continue
+            existing = conn.execute(
+                """SELECT id FROM revaluation_requests
+                   WHERE assessment_id = ? AND roll_number = ? AND question_id = ?
+                     AND subpart = ? AND lower(reason) = lower(?) AND evaluation_id = ?""",
+                (assessment_id, roll, question_id, subpart, reason, int(evaluation_id)),
+            ).fetchone()
+            if existing:
+                duplicates += 1
+                continue
+            conn.execute(
+                """INSERT INTO revaluation_requests
+                   (assessment_id, evaluation_id, roll_number, student_email,
+                    question_id, subpart, reason, source_row, status,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SUBMITTED', ?, ?)""",
+                (assessment_id, int(evaluation_id), roll, email or None,
+                 question_id, subpart, reason, str(source_row or ""), timestamp, timestamp),
+            )
+            inserted += 1
+    return {"inserted": inserted, "duplicates": duplicates, "unmatched": unmatched}
+
+
+def list_revaluation_requests(assessment_id: str | None = None) -> list[dict[str, Any]]:
+    """Return persisted re-evaluation requests, newest first."""
+    init_db()
+    with _connect() as conn:
+        if assessment_id:
+            rows = conn.execute(
+                """SELECT r.*, e.student_name, e.question_text, e.answer_text,
+                          e.ai_marks, e.teacher_marks, e.max_marks, e.review_status
+                   FROM revaluation_requests r
+                   LEFT JOIN evaluations e ON e.id = r.evaluation_id
+                   WHERE r.assessment_id = ?
+                   ORDER BY r.question_id, r.subpart, r.created_at, r.id""",
+                (assessment_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT r.*, e.student_name, e.question_text, e.answer_text,
+                          e.ai_marks, e.teacher_marks, e.max_marks, e.review_status
+                   FROM revaluation_requests r
+                   LEFT JOIN evaluations e ON e.id = r.evaluation_id
+                   ORDER BY r.created_at DESC, r.id DESC"""
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_revaluation_request(
+    *, request_id: int, status: str, teacher_decision: str | None = None,
+    teacher_note: str | None = None, actor: str = "Teacher"
+) -> None:
+    """Record a teacher's administrative decision about a request.
+
+    This does not alter marks; mark changes continue through save_teacher_decision
+    so existing mark-validation and audit behavior remains authoritative.
+    """
+    allowed = {"SUBMITTED", "UNDER_REVIEW", "RESOLVED_UPHELD", "RESOLVED_REVISED"}
+    if status not in allowed:
+        raise ValueError(f"Unsupported re-evaluation request status: {status}")
+    init_db()
+    timestamp = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM revaluation_requests WHERE id = ?", (int(request_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Re-evaluation request {request_id} was not found.")
+        conn.execute(
+            """UPDATE revaluation_requests
+               SET status = ?, teacher_decision = ?, teacher_note = ?,
+                   updated_at = ?, updated_by = ?
+               WHERE id = ?""",
+            (status, (teacher_decision or "").strip() or None,
+             (teacher_note or "").strip() or None, timestamp,
+             (actor or "Teacher").strip(), int(request_id)),
+        )
