@@ -19,7 +19,8 @@ class ModelClient:
             "openai/gpt-oss-120b",
         )
 
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key_env = os.getenv("MODEL_API_KEY_ENV", "GROQ_API_KEY")
+        api_key = os.getenv(api_key_env)
 
         if not api_key:
             raise ValueError(
